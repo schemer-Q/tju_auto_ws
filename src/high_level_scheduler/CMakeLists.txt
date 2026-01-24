@@ -1,6 +1,10 @@
 cmake_minimum_required(VERSION 3.5)
 project(high_level_scheduler)
 
+# Suppress catkin-related warnings from colcon/environment
+if(DEFINED CATKIN_INSTALL_INTO_PREFIX_ROOT)
+  unset(CATKIN_INSTALL_INTO_PREFIX_ROOT)
+endif()
 
 find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)

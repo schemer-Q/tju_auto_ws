@@ -15,4 +15,9 @@ install(TARGETS
   DESTINATION lib/${PROJECT_NAME}
 )
 
+install(PROGRAMS
+  scripts/mock_map_pub.py
+  DESTINATION lib/${PROJECT_NAME}
+)
+
 ament_package()

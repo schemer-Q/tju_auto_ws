@@ -9,14 +9,22 @@ class DynamicMapNode : public rclcpp::Node
 public:
   DynamicMapNode(): Node("dynamic_map_node")
   {
+    // parameters
+    this->declare_parameter<int>("map_size_x", 100);
+    this->declare_parameter<int>("map_size_y", 100);
+    this->declare_parameter<double>("map_resolution", 0.1);
+    this->declare_parameter<double>("inflation_radius", 0.3); // meters
+
+    size_x_ = this->get_parameter("map_size_x").as_int();
+    size_y_ = this->get_parameter("map_size_y").as_int();
+    resolution_ = this->get_parameter("map_resolution").as_double();
+    inflation_radius_ = this->get_parameter("inflation_radius").as_double();
+
     pub_static_ = this->create_publisher<nav_msgs::msg::OccupancyGrid>("/map/static", 10);
     pub_dynamic_ = this->create_publisher<nav_msgs::msg::OccupancyGrid>("/map/dynamic", 10);
     pub_inflated_ = this->create_publisher<nav_msgs::msg::OccupancyGrid>("/map/inflated", 10);
     pub_combined_ = this->create_publisher<nav_msgs::msg::OccupancyGrid>("/map/combined", 10);
     timer_ = this->create_wall_timer(std::chrono::milliseconds(1000), std::bind(&DynamicMapNode::on_timer, this));
-    size_x_ = 100;
-    size_y_ = 100;
-    resolution_ = 0.1;
   }
 
 private:
@@ -34,13 +42,46 @@ private:
     if (idx >= 0 && idx < (int)dynamic_grid.data.size())
       dynamic_grid.data[idx] = 100;
 
-    // simple inflation (3x3)
-    for (int dx=-1; dx<=1; ++dx) {
-      for (int dy=-1; dy<=1; ++dy) {
-        int x = cx + dx;
-        int y = cy + dy;
-        if (x>=0 && x<size_x_ && y>=0 && y<size_y_) {
-          inflated_grid.data[y*size_x_ + x] = 100;
+    // inflation using BFS (radius in cells)
+    int radius_cells = std::max(0, (int)std::ceil(inflation_radius_ / resolution_));
+    if (radius_cells == 0) {
+      // no inflation
+      inflated_grid = dynamic_grid;
+    } else {
+      // visited distances (-1 = unvisited)
+      std::vector<int> dist(size_x_ * size_y_, -1);
+      std::deque<std::pair<int,int>> qx;
+      std::deque<std::pair<int,int>> q;
+      // push all occupied cells as sources
+      for (int y=0;y<size_y_;++y){
+        for (int x=0;x<size_x_;++x){
+          int i = y*size_x_ + x;
+          if (dynamic_grid.data[i] > 50) {
+            dist[i] = 0;
+            inflated_grid.data[i] = 100;
+            q.emplace_back(x,y);
+          }
+        }
+      }
+      // 4-neighborhood BFS
+      const int dxs[4] = {1,-1,0,0};
+      const int dys[4] = {0,0,1,-1};
+      while (!q.empty()) {
+        auto p = q.front(); q.pop_front();
+        int cx2 = p.first;
+        int cy2 = p.second;
+        int ci = cy2 * size_x_ + cx2;
+        int cd = dist[ci];
+        if (cd >= radius_cells) continue;
+        for (int k=0;k<4;++k){
+          int nx = cx2 + dxs[k];
+          int ny = cy2 + dys[k];
+          if (nx<0 || nx>=size_x_ || ny<0 || ny>=size_y_) continue;
+          int ni = ny*size_x_ + nx;
+          if (dist[ni] != -1) continue;
+          dist[ni] = cd + 1;
+          inflated_grid.data[ni] = 100;
+          q.emplace_back(nx, ny);
         }
       }
     }
@@ -83,6 +124,7 @@ private:
   int size_x_;
   int size_y_;
   double resolution_;
+  double inflation_radius_;
 };
 
 int main(int argc, char ** argv)
