@@ -105,3 +105,70 @@
     /planner/waypoints (geometry_msgs/PoseArray) - 路径点
 
     /planner/status (std_msgs/String) - 规划器状态
+
+## 构建与运行（ROS 2 Foxy - C++ / ament_cmake）
+
+快速步骤：
+
+1. 在终端加载 ROS Foxy 环境并构建工作区：
+
+```bash
+source /opt/ros/foxy/setup.bash
+cd /home/nvidia/tju_auto_ws
+colcon build --symlink-install
+source install/setup.bash
+```
+
+2. 启动节点（在不同终端分别运行）：
+
+```bash
+# 启动动态地图节点
+ros2 run dynamic_map dynamic_map_node
+
+# 启动高层调度节点
+ros2 run high_level_scheduler scheduler_node
+
+# 启动路径规划节点
+ros2 run path_planner planner_node
+```
+
+或者使用包内的 launch 文件：
+
+```bash
+ros2 launch dynamic_map dynamic_map_launch.py
+ros2 launch high_level_scheduler scheduler_launch.py
+ros2 launch path_planner planner_launch.py
+```
+
+3. 示例任务发布（需构造 `control_task_msgs/TaskGoalData` 消息并发布到 `/task_goal`）：
+
+```bash
+# 示例：使用 rclpy/rclcpp 节点或自定义发布工具发布 TaskGoalData
+```
+
+## 已实现的话题（摘要）
+
+- `/map/static` (nav_msgs/OccupancyGrid) - 静态层
+- `/map/dynamic` (nav_msgs/OccupancyGrid) - 动态障碍物层
+- `/map/inflated` (nav_msgs/OccupancyGrid) - 膨胀层
+- `/map/combined` (nav_msgs/OccupancyGrid) - 合并后栅格
+- `/task_goal` (control_task_msgs/TaskGoalData) - 上层任务输入（建议话题名）
+- `/planner/task` (control_task_msgs/TaskGoalData) - 调度发往规划器的任务
+- `/planner/global_path` (nav_msgs/Path) - 规划器输出路径
+
+## 自定义消息位置
+
+自定义消息位于工作区 `src/tju_msgs`：
+
+- `control_task_msgs/msg/TaskGoalData.msg`
+- `common_msgs/msg/PosePoint.msg`
+
+## 说明与建议的下一步
+
+- 当前实现为可运行原型：动态地图节点发布示例占据栅格，调度器做消息转发，规划器生成简单直线路径。
+- 建议下一步完善：
+  - 在 `dynamic_map` 中加入参数化的膨胀半径与更高效的膨胀算法；
+  - 在 `high_level_scheduler` 中实现任务队列、优先级与状态反馈；
+  - 在 `path_planner` 中集成更完善的全局/局部规划算法与轨迹优化。
+
+如果你同意，我可以依次实现上述一项并运行构建和集成测试。
