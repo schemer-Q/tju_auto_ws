@@ -2,6 +2,7 @@ build/
 install/
 log/
 map/
+docs/
 .vscode/
 log_dynamic_map.txt
 log_planner.txt
