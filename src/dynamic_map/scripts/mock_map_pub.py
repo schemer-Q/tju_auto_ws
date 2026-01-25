@@ -103,6 +103,8 @@ class MockMapPublisher(Node):
         qos.durability = DurabilityPolicy.TRANSIENT_LOCAL
         self.pub = self.create_publisher(OccupancyGrid, '/map/combined', qos)
         self.pub_task = self.create_publisher(TaskGoalData, '/planner/task', 10)
+        # Publisher to forward initialpose to start_pose for the planner
+        self.pub_start = self.create_publisher(PoseStamped, '/start_pose', 10)
 
         # Subscribe to PoseStamped start and goal
         self.sub_start = self.create_subscription(
@@ -130,7 +132,11 @@ class MockMapPublisher(Node):
         self.timer_period = 1.0 / args.rate
         self.task_order_id = 0
 
-        self.start_pose = None
+        # Initialize start_pose to origin so TF can be broadcast immediately
+        self.start_pose = PoseStamped()
+        self.start_pose.header.frame_id = 'map'
+        self.start_pose.pose.orientation.w = 1.0
+
         self.last_goal_pose = None
         self.map_published = False
         self.last_sub_count = 0
@@ -160,8 +166,8 @@ class MockMapPublisher(Node):
         self.on_timer()
         # Republish when new subscribers connect
         self.timer = self.create_timer(self.timer_period, self.on_timer)
-        # TF broadcast disabled - not needed for map frame visualization
-        # self.tf_timer = self.create_timer(0.1, self.broadcast_tf)
+        # TF broadcast enabled to provide map->base_link transform for visualization
+        self.tf_timer = self.create_timer(0.1, self.broadcast_tf)
 
     def publish_map_unconditional(self):
         msg = OccupancyGrid()
@@ -216,10 +222,14 @@ class MockMapPublisher(Node):
         self.tf_broadcaster.sendTransform(t)
     
     def on_initialpose(self, msg: PoseWithCovarianceStamped):
+        """Handle 2D Pose Estimate from RViz and republish as /start_pose."""
         ps = PoseStamped()
         ps.header = msg.header
         ps.pose = msg.pose.pose
-        self.on_start_pose(ps)
+        # Publish to /start_pose so planner_node receives it
+        self.pub_start.publish(ps)
+        # on_start_pose will be called via subscription callback
+        self.get_logger().info(f"Received /initialpose, republished to /start_pose")
 
     def on_goal_pose(self, msg):
         """Handle 2D Goal Pose from RViz and publish TaskGoalData for planner"""
