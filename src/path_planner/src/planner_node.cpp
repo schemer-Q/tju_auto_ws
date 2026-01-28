@@ -199,15 +199,86 @@ public:
       return states;
   }
   
+  bool check_collision(double cx, double cy, double theta) {
+      if (!last_map_) return false;
+      int width = last_map_->info.width;
+      int height = last_map_->info.height;
+      double res = last_map_->info.resolution;
+      
+      double cos_t = std::cos(theta);
+      double sin_t = std::sin(theta);
+      double hw = vehicle_width_ / 2.0;
+      
+      // Calculate AABB of rotated vehicle footprint
+      // Corners relative to center
+      double dx[4] = {front_to_axle_, front_to_axle_, -back_to_axle_, -back_to_axle_};
+      double dy[4] = {hw, -hw, hw, -hw};
+      
+      double min_x = 1e10, max_x = -1e10, min_y = 1e10, max_y = -1e10;
+      
+      for(int i=0; i<4; ++i) {
+          double wx = cx + dx[i]*cos_t - dy[i]*sin_t;
+          double wy = cy + dx[i]*sin_t + dy[i]*cos_t;
+          if(wx < min_x) min_x = wx;
+          if(wx > max_x) max_x = wx;
+          if(wy < min_y) min_y = wy;
+          if(wy > max_y) max_y = wy;
+      }
+      
+      int min_gx = std::max(0, (int)std::floor(min_x / res));
+      int max_gx = std::min(width - 1, (int)std::ceil(max_x / res));
+      int min_gy = std::max(0, (int)std::floor(min_y / res));
+      int max_gy = std::min(height - 1, (int)std::ceil(max_y / res));
+      
+      for (int y = min_gy; y <= max_gy; ++y) {
+          for (int x = min_gx; x <= max_gx; ++x) {
+              int idx = y * width + x;
+              if (last_map_->data[idx] > 50) { // If obstacle
+                   // Check if inside oriented rectangle
+                   double cell_wx = (x + 0.5) * res;
+                   double cell_wy = (y + 0.5) * res;
+                   
+                   // Transform to vehicle frame
+                   double tx = cell_wx - cx;
+                   double ty = cell_wy - cy;
+                   
+                   // Rotate back by -theta
+                   double local_x = tx * cos_t + ty * sin_t;
+                   double local_y = -tx * sin_t + ty * cos_t;
+                   
+                   if (local_x >= -back_to_axle_ && local_x <= front_to_axle_ &&
+                       local_y >= -hw && local_y <= hw) {
+                       return true; // Collision
+                   }
+              }
+          }
+      }
+      return false; // Safe
+  }
+
   bool is_collision_free(const std::vector<HybridAStarState*>& states, int width, int height) {
-      for (auto s : states) {
-        if (s->x < 0 || s->x >= width || s->y < 0 || s->y >= height) return false;
-        int idx = s->y * width + s->x;
-        if (idx >= 0 && idx < (int)last_map_->data.size()) {
-             if (last_map_->data[idx] > 50) return false;
-        } else return false;
-    }
-    return true;
+      (void)width; (void)height;
+      
+      // Optimization: Skip checking every single interpolated point.
+      // We check points every ~0.3m to 0.5m interval.
+      // Assuming 'states' typically comes from Dubins sampling with ~0.1m step.
+      
+      if (states.empty()) return true;
+
+      // Always check the first and last point
+      if (check_collision(states.front()->cx, states.front()->cy, states.front()->theta)) return false;
+      if (states.size() > 1) {
+          if (check_collision(states.back()->cx, states.back()->cy, states.back()->theta)) return false;
+      }
+      
+      // Check intermediate points with stride
+      // Stride of 4 implies checking every ~0.4m if res=0.1
+      size_t stride = 4; 
+      
+      for (size_t i = 1; i < states.size() - 1; i += stride) {
+         if (check_collision(states[i]->cx, states[i]->cy, states[i]->theta)) return false;
+      }
+      return true;
   }
   
   PlannerNode(): Node("planner_node")
@@ -219,6 +290,12 @@ public:
     // parameters
     this->declare_parameter<double>("min_turning_radius", 1.0);
     min_turning_radius_ = this->get_parameter("min_turning_radius").as_double();
+    
+    // Default vehicle dimensions (Standard Sedan)
+    vehicle_length_ = 4.7; 
+    vehicle_width_ = 2.0; 
+    back_to_axle_ = 1.0; 
+    front_to_axle_ = vehicle_length_ - back_to_axle_;
   }
 
 private:
@@ -564,8 +641,12 @@ private:
             int grid_new_y = std::round(new_cy / res);
 
             if (grid_new_x < 0 || grid_new_x >= width || grid_new_y < 0 || grid_new_y >= height) continue;
-            int idx = grid_new_y * width + grid_new_x;
-            if (last_map_->data[idx] > 50) continue; // occupied
+            
+            // Replaced point check with Full Body Collision Check
+            if (check_collision(new_cx, new_cy, new_theta)) continue; 
+            
+            // int idx = grid_new_y * width + grid_new_x;
+            // if (last_map_->data[idx] > 50) continue; // occupied
 
             std::string nk = key(grid_new_x, grid_new_y, new_theta);
             if (closed_list.find(nk) != closed_list.end()) continue;
@@ -640,6 +721,12 @@ private:
   nav_msgs::msg::OccupancyGrid::SharedPtr last_map_;
   geometry_msgs::msg::PoseStamped::SharedPtr start_pose_;
   double min_turning_radius_;
+
+  // Vehicle Dimensions for Collision Checking
+  double vehicle_length_;
+  double vehicle_width_;
+  double back_to_axle_;
+  double front_to_axle_;
 
   nav_msgs::msg::Path smooth_path(const nav_msgs::msg::Path& raw_path) {
     nav_msgs::msg::Path smoothed_path = raw_path;

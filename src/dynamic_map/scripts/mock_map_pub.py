@@ -283,7 +283,8 @@ class MockMapPublisher(Node):
             msg.info.resolution = self.resolution
             msg.info.width = self.width
             msg.info.height = self.height
-            org = self.shifted_origin()
+            # Always use static base origin (no shifting by start pose)
+            org = self.base_origin
             msg.info.origin.position.x = float(org[0])
             msg.info.origin.position.y = float(org[1])
             msg.info.origin.position.z = 0.0
