@@ -64,6 +64,11 @@ Visualization Manager:
       Topic: /planner/global_path
       Unreliable: false
       Value: true
+    - Class: rviz_default_plugins/MarkerArray
+      Enabled: true
+      Name: VehicleFootprints
+      Topic: /planner/footprints
+      Value: true
   Enabled: true
   Global Options:
     Background Color: 48; 48; 48

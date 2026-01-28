@@ -2,6 +2,7 @@
 #include <nav_msgs/msg/path.hpp>
 #include <nav_msgs/msg/occupancy_grid.hpp>
 #include <geometry_msgs/msg/pose_stamped.hpp>
+#include <visualization_msgs/msg/marker_array.hpp>
 #include <control_task_msgs/msg/task_goal_data.hpp>
 #include <vector>
 #include <queue>
@@ -287,6 +288,7 @@ public:
     sub_map_ = this->create_subscription<nav_msgs::msg::OccupancyGrid>("/map/combined", 10, std::bind(&PlannerNode::on_map, this, std::placeholders::_1));
     sub_start_ = this->create_subscription<geometry_msgs::msg::PoseStamped>("/start_pose", 10, std::bind(&PlannerNode::on_start, this, std::placeholders::_1));
     pub_path_ = this->create_publisher<nav_msgs::msg::Path>("/planner/global_path", 10);
+    pub_markers_ = this->create_publisher<visualization_msgs::msg::MarkerArray>("/planner/footprints", 10);
     // parameters
     this->declare_parameter<double>("min_turning_radius", 1.0);
     min_turning_radius_ = this->get_parameter("min_turning_radius").as_double();
@@ -416,6 +418,9 @@ private:
     smoothed_path.header.stamp = this->now();
     smoothed_path.header.frame_id = last_map_->header.frame_id;
     pub_path_->publish(smoothed_path);
+    
+    // Visualize Vehicle Footprints periodically
+    publish_vehicle_footprints(smoothed_path);
 
     // Print path coordinates for comparison
     size_t n = smoothed_path.poses.size();
@@ -718,6 +723,7 @@ private:
   rclcpp::Subscription<nav_msgs::msg::OccupancyGrid>::SharedPtr sub_map_;
   rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr sub_start_;
   rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr pub_path_;
+  rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr pub_markers_;
   nav_msgs::msg::OccupancyGrid::SharedPtr last_map_;
   geometry_msgs::msg::PoseStamped::SharedPtr start_pose_;
   double min_turning_radius_;
@@ -762,6 +768,83 @@ private:
     }
 
     return smoothed_path;
+  }
+
+  void publish_vehicle_footprints(const nav_msgs::msg::Path& path) {
+      if (path.poses.empty()) return;
+      
+      visualization_msgs::msg::MarkerArray mk_array;
+      // Delete old markers
+      visualization_msgs::msg::Marker delete_mk;
+      delete_mk.action = visualization_msgs::msg::Marker::DELETEALL;
+      mk_array.markers.push_back(delete_mk);
+      
+      // Calculate geometric center offset from rear axle
+      // Rear axle is at 0 in vehicle frame.
+      // Box range: [-back_to_axle_, front_to_axle_]
+      // Center = (-back + front) / 2
+      double center_offset = (front_to_axle_ - back_to_axle_) / 2.0;
+      
+      int id = 0;
+      
+      // Select points based on distance
+      std::vector<size_t> indices;
+      if (!path.poses.empty()) {
+          indices.push_back(0); // Start
+          
+          double accumulated_dist = 0.0;
+          double sample_interval = 2.0; // Draw every 2 meters
+          
+          for (size_t i = 1; i < path.poses.size(); ++i) {
+              const auto& p_prev = path.poses[i-1].pose.position;
+              const auto& p_curr = path.poses[i].pose.position;
+              double d = std::hypot(p_curr.x - p_prev.x, p_curr.y - p_prev.y);
+              accumulated_dist += d;
+              
+              if (accumulated_dist >= sample_interval) {
+                  indices.push_back(i);
+                  accumulated_dist = 0.0;
+              }
+          }
+          
+          // Ensure goal is included if not too close to last sample
+          if (indices.back() != path.poses.size() - 1) {
+              indices.push_back(path.poses.size() - 1);
+          }
+      }
+      
+      for(auto idx : indices) {
+          const auto& pose = path.poses[idx];
+          
+          visualization_msgs::msg::Marker curr_mk;
+          curr_mk.header = path.header;
+          curr_mk.ns = "vehicle_footprints";
+          curr_mk.id = id++;
+          curr_mk.type = visualization_msgs::msg::Marker::CUBE;
+          curr_mk.action = visualization_msgs::msg::Marker::ADD;
+          
+          double yaw = yaw_from_quat(pose.pose.orientation);
+          
+          // Position: Shift from Axle to Geometric Center
+          curr_mk.pose.position.x = pose.pose.position.x + center_offset * std::cos(yaw);
+          curr_mk.pose.position.y = pose.pose.position.y + center_offset * std::sin(yaw);
+          curr_mk.pose.position.z = 0.75; // Half of 1.5 height
+          
+          curr_mk.pose.orientation = pose.pose.orientation;
+          
+          curr_mk.scale.x = vehicle_length_;
+          curr_mk.scale.y = vehicle_width_;
+          curr_mk.scale.z = 1.5;
+          
+          curr_mk.color.r = 0.0;
+          curr_mk.color.g = 0.5;
+          curr_mk.color.b = 1.0;
+          curr_mk.color.a = 0.3; // Transparent
+          
+          mk_array.markers.push_back(curr_mk);
+      }
+      
+      pub_markers_->publish(mk_array);
   }
 };
 
