@@ -10,23 +10,37 @@
 
 using control_task_msgs::msg::TaskGoalData;
 
+// --- Dubins Path Helper ---
+struct DubinsPath {
+    double length;
+    std::vector<double> lengths; // 3 segments
+    std::vector<int> types;     // L=-1, S=0, R=1
+    double x, y, yaw;           // Start pose
+    double turning_radius;
+
+    DubinsPath() : length(std::numeric_limits<double>::max()), turning_radius(1.0) {}
+};
+// --------------------------
+
 struct HybridAStarState {
     int x, y; // Grid indices for lookup
     double cx, cy; // Continuous world coordinates within the grid frame (meters)
     double theta; // Continuous theta
+    double steering; // Steering angle used to reach this state
+    int direction; // 1: Forward, -1: Reverse
     double g_cost;
     double h_cost;
     HybridAStarState* parent;
     
-    HybridAStarState(double cx_, double cy_, double t_, double g_, double h_, HybridAStarState* p_, double res)
-        : cx(cx_), cy(cy_), theta(t_), g_cost(g_), h_cost(h_), parent(p_) {
+    HybridAStarState(double cx_, double cy_, double t_, double steer_, int dir_, double g_, double h_, HybridAStarState* p_, double res)
+        : cx(cx_), cy(cy_), theta(t_), steering(steer_), direction(dir_), g_cost(g_), h_cost(h_), parent(p_) {
         x = std::round(cx / res);
         y = std::round(cy / res);
     }
     
     // Legacy constructor for compatibility if needed, but better to use continuous
     HybridAStarState(int x_, int y_, double t_, double g_, double h_, HybridAStarState* p_)
-        : x(x_), y(y_), cx(x_ * 0.1), cy(y_ * 0.1), theta(t_), g_cost(g_), h_cost(h_), parent(p_) {}
+        : x(x_), y(y_), cx(x_ * 0.1), cy(y_ * 0.1), theta(t_), steering(0.0), direction(1), g_cost(g_), h_cost(h_), parent(p_) {}
 };
 
 struct CompareState {
@@ -38,6 +52,164 @@ struct CompareState {
 class PlannerNode : public rclcpp::Node
 {
 public:
+  // --- Dubins Solver Implementation ---
+  // Simple Dubins implementation for LSL, LSR, RSL, RSR cases
+  double mod2pi(double theta) {
+      return theta - 2.0 * M_PI * std::floor(theta / (2.0 * M_PI));
+  }
+  
+  DubinsPath get_dubins_path(double sx, double sy, double syaw, double ex, double ey, double eyaw, double r) {
+      double dx = ex - sx;
+      double dy = ey - sy;
+      double D = std::sqrt(dx*dx + dy*dy);
+      double d = D / r; // normalized distance
+      
+      // Coordinate transformation to standard frame
+      double theta = mod2pi(std::atan2(dy, dx));
+      double alpha = mod2pi(syaw - theta);
+      double beta = mod2pi(eyaw - theta);
+      
+      DubinsPath best_path;
+      
+      auto update_path = [&](double t, double p, double q, int type1, int type2, int type3) {
+          double L = std::abs(t) + std::abs(p) + std::abs(q);
+          if (L < best_path.length) { // In normalized units? 
+             // We need real length
+             best_path.length = L * r; // Convert back just for comparison? No, wait. formula gives normalized.
+             best_path.lengths = {t, p, q};
+             best_path.types = {type1, type2, type3};
+             best_path.length = (std::abs(t) + std::abs(p) + std::abs(q)) * r;
+          }
+      };
+
+      // LSL
+      double tmp_lsl = alpha - beta;
+      double sa = std::sin(alpha), sb = std::sin(beta);
+      double ca = std::cos(alpha), cb = std::cos(beta);
+      double c_ab = std::cos(alpha - beta);
+      
+      double tmp0 = d + sa - sb;
+      double p_squared = 2 + (d*d) - (2*c_ab) + (2*d*(sa - sb));
+      if(p_squared >= 0) {
+          double tmp1 = std::atan2((cb - ca), tmp0);
+          double t = mod2pi(-alpha + tmp1);
+          double p = std::sqrt(p_squared);
+          double q = mod2pi(beta - tmp1);
+          update_path(t, p, q, -1, 0, -1); // LSL
+      }
+      
+      // RSR
+      double p_squared_rsr = 2 + (d*d) - (2*c_ab) + (2*d*(sb - sa));
+      if(p_squared_rsr >= 0) {
+          double tmp1 = std::atan2((ca - cb), (d - sa + sb));
+          double t = mod2pi(alpha - tmp1);
+          double p = std::sqrt(p_squared_rsr);
+          double q = mod2pi(-beta + tmp1);
+          update_path(t, p, q, 1, 0, 1); // RSR
+      }
+      
+      // LSR
+      double p_squared_lsr = -2 + (d*d) + (2*c_ab) + (2*d*(sa + sb));
+      if(p_squared_lsr >= 0) {
+          double p = std::sqrt(p_squared_lsr);
+          double tmp1 = std::atan2((-ca - cb), (d + sa + sb));
+          double t = mod2pi(-alpha + tmp1 - std::atan2(-2.0, p));
+          double q = mod2pi(-mod2pi(beta) + tmp1 - std::atan2(-2.0, p));
+          update_path(t, p, q, -1, 0, 1); // LSR
+      }
+
+      // RSL
+      double p_squared_rsl = -2 + (d*d) + (2*c_ab) - (2*d*(sa + sb));
+      if(p_squared_rsl >= 0) {
+          double p = std::sqrt(p_squared_rsl);
+          double tmp1 = std::atan2((ca + cb), (d - sa - sb));
+          double t = mod2pi(alpha - tmp1 + std::atan2(2.0, p));
+          double q = mod2pi(beta - tmp1 + std::atan2(2.0, p));
+          update_path(t, p, q, 1, 0, -1); // RSL
+      }
+      
+      best_path.x = sx; best_path.y = sy; best_path.yaw = syaw; best_path.turning_radius = r;
+      return best_path;
+  }
+  
+  std::vector<HybridAStarState*> sample_dubins(DubinsPath dpath, HybridAStarState* parent, double res, int target_dir, double cost_scale = 1.0) {
+      std::vector<HybridAStarState*> states;
+      double step = res * 0.5; // Sampling step - finer than grid
+      
+      double c_x = dpath.x, c_y = dpath.y, c_yaw = dpath.yaw;
+      double r = dpath.turning_radius;
+      
+      HybridAStarState* current_parent = parent;
+
+      for (size_t i = 0; i < 3; ++i) {
+          double mode_len = dpath.lengths[i] * r;
+          int mode = dpath.types[i]; // -1, 0, 1
+          
+          if (mode_len < 1e-4) continue;
+          
+          // Use while loop to cover exact distance
+          double dist_covered = 0.0;
+          
+          while (dist_covered < mode_len) {
+              double remain = mode_len - dist_covered;
+              double dist = (remain < step) ? remain : step;
+              if (dist < 1e-6) break; // Avoid floating point infinite loop
+              
+              dist_covered += dist;
+
+              // Update state (Geometry Simulation)
+              if (mode == 0) { // Straight
+                  c_x += dist * std::cos(c_yaw);
+                  c_y += dist * std::sin(c_yaw);
+              } else { // Turn
+                  // Left (-1) -> +dtheta, Right (1) -> -dtheta
+                  double dir = (mode == -1) ? 1.0 : -1.0;
+                  double dtheta = dir * (dist / r);
+                  double chord = 2.0 * r * std::sin(std::abs(dtheta) / 2.0);
+                  
+                  c_x += chord * std::cos(c_yaw + dtheta/2.0);
+                  c_y += chord * std::sin(c_yaw + dtheta/2.0);
+                  c_yaw += dtheta;
+              }
+              
+              // Normalize Yaw for simulation state
+              while(c_yaw > M_PI) c_yaw -= 2.0*M_PI;
+              while(c_yaw <= -M_PI) c_yaw += 2.0*M_PI;
+              
+              // Create Node logic
+              double g = current_parent->g_cost + (dist * cost_scale); 
+              if (mode != 0) g += dist * 0.05 * cost_scale; // Turn penalty
+
+              double steer = (mode == 0) ? 0.0 : ((mode == -1) ? 1.0/r : -1.0/r);
+              
+              // Interpret Pose for Target Direction
+              double actual_theta = c_yaw;
+              if (target_dir == -1) {
+                  actual_theta += M_PI; // Flip back
+              }
+              // Norm
+              while(actual_theta > M_PI) actual_theta -= 2.0*M_PI;
+              while(actual_theta <= -M_PI) actual_theta += 2.0*M_PI;
+
+              HybridAStarState* node = new HybridAStarState(c_x, c_y, actual_theta, steer, target_dir, g, 0.0, current_parent, res);
+              states.push_back(node);
+              current_parent = node;
+          }
+      }
+      return states;
+  }
+  
+  bool is_collision_free(const std::vector<HybridAStarState*>& states, int width, int height) {
+      for (auto s : states) {
+        if (s->x < 0 || s->x >= width || s->y < 0 || s->y >= height) return false;
+        int idx = s->y * width + s->x;
+        if (idx >= 0 && idx < (int)last_map_->data.size()) {
+             if (last_map_->data[idx] > 50) return false;
+        } else return false;
+    }
+    return true;
+  }
+  
   PlannerNode(): Node("planner_node")
   {
     sub_task_ = this->create_subscription<TaskGoalData>("/planner/task", 10, std::bind(&PlannerNode::on_task, this, std::placeholders::_1));
@@ -93,18 +265,31 @@ private:
     double start_yaw = yaw_from_quat(start_pose_->pose.orientation);
     nav_msgs::msg::Path raw_path = plan_hybrid_astar(start_pose_->pose.position.x, start_pose_->pose.position.y, start_yaw,
                                                        msg->end_point.x, msg->end_point.y, msg->end_point.yaw);
-    nav_msgs::msg::Path smoothed_path = smooth_path(raw_path);
+    // nav_msgs::msg::Path smoothed_path = smooth_path(raw_path);
+    // Skip smoothing to preserve kinematic constraints (curvature limits) enforced by Hybrid A*
+    nav_msgs::msg::Path smoothed_path = raw_path; 
 
     // Post-process: Recalculate Orientations and enforce exact start/goal
     if (!smoothed_path.poses.empty()) {
         // Enforce exact Start Pose
         smoothed_path.poses.front().pose.position.x = start_pose_->pose.position.x;
         smoothed_path.poses.front().pose.position.y = start_pose_->pose.position.y;
+        smoothed_path.poses.front().pose.orientation = start_pose_->pose.orientation;
         
         // Enforce exact Goal Pose
         smoothed_path.poses.back().pose.position.x = msg->end_point.x;
         smoothed_path.poses.back().pose.position.y = msg->end_point.y;
-
+        
+        // Since we guided A* to align with goal yaw, we can safely snap the final orientation
+        // without causing a huge jump.
+        double half_yaw = msg->end_point.yaw / 2.0;
+        smoothed_path.poses.back().pose.orientation.z = std::sin(half_yaw);
+        smoothed_path.poses.back().pose.orientation.w = std::cos(half_yaw);
+        
+        // Hybrid A* provides valid orientations (kinematic). 
+        // Do NOT overwrite them with geometric tangents, as that destroys the smoothness property.
+        
+        /* 
         // Recalculate yaw for all points based on tangent
         for (size_t i = 0; i < smoothed_path.poses.size(); ++i) {
             double yaw = 0.0;
@@ -148,6 +333,7 @@ private:
              smoothed_path.poses[1].pose.orientation.z = std::sin(new_yaw / 2.0);
              smoothed_path.poses[1].pose.orientation.w = std::cos(new_yaw / 2.0);
         }
+        */
     }
 
     smoothed_path.header.stamp = this->now();
@@ -227,14 +413,19 @@ private:
     };
 
     // Fix heuristic scaling: ensure h_cost matches g_cost physics units (meters)
-    double h_start = heuristic(start_x_grid, start_y_grid, goal_x_grid, goal_y_grid) * res;
-    // For Start Node, use actual continuous theta for better initial smoothing
-    // We still discretize it for KEY generation inside the loop, but state tracks continuous
+    
     double start_theta_norm = start_theta;
     while (start_theta_norm > M_PI) start_theta_norm -= 2.0 * M_PI;
     while (start_theta_norm <= -M_PI) start_theta_norm += 2.0 * M_PI;
     
-    HybridAStarState* start = new HybridAStarState(start_grid_xy.first, start_grid_xy.second, start_theta_norm, 0.0, h_start, nullptr, res);
+    double h_start = heuristic(start_grid_xy.first, start_grid_xy.second, start_theta_norm, 
+                               goal_grid_xy.first, goal_grid_xy.second, goal_theta);
+    // double h_start = heuristic(start_x_grid, start_y_grid, goal_x_grid, goal_y_grid) * res;
+    
+    // Initial steering is 0.0, g_cost=0.0
+    // Constructor args: cx, cy, theta, steer, dir, g, h, parent, res
+    // Change start direction to 0 (Stopped/Neutral) so first move (Forward/Reverse) has NO penalty
+    HybridAStarState* start = new HybridAStarState(start_grid_xy.first, start_grid_xy.second, start_theta_norm, 0.0, 0, 0.0, h_start, nullptr, res);
     
     all_states.push_back(start);
     open_list.push(start);
@@ -244,14 +435,25 @@ private:
     // Resolution = 0.1. Step = 0.5 is 5 cells. Should be ok.
     double step_size = 0.5;
     
+    // Generate steering primitives (curvature k)
+    // We use a set of curvatures from -max to +max to allow smooth transitions
+    double max_curvature = 1.0 / min_turning_radius_;
+    std::vector<double> steer_actions;
+    int num_steer = 7; // -max, -2/3, -1/3, 0, 1/3, 2/3, max
+    for (int i = 0; i < num_steer; ++i) {
+        double alpha = (double)i / (num_steer - 1); // 0 to 1
+        double k = max_curvature * (2.0 * alpha - 1.0);
+        steer_actions.push_back(k);
+    }
+    
+    // Reverse Penalty parameters
+    double reverse_penalty_factor = 1.05; // Make reverse slightly more expensive
+    double gear_switch_penalty = 2.0;    // Cost to change between forward/reverse
+
     // Penalize turning slightly more to encourage straight paths if costs are similar
     double turn_penalty_factor = 1.05; 
-
-    std::vector<std::tuple<double, double, double>> actions_weighted = {
-        {step_size, 0.0, 1.0}, // straight, cost multiplier 1.0
-        {step_size, 1.0 / min_turning_radius_, turn_penalty_factor}, // left turn
-        {step_size, -1.0 / min_turning_radius_, turn_penalty_factor} // right turn
-    };
+    // Penalize changing steering angle (limit angular jerk)
+    double steer_change_penalty = 2.0; 
 
     HybridAStarState* goal_state = nullptr;
     int max_iterations = 50000; 
@@ -264,42 +466,117 @@ private:
       if (closed_list.find(k) != closed_list.end()) continue;
       closed_list[k] = current;
 
-      // Check if close to goal (looser check due to discrete nature)
-      if (std::abs(current->x - goal_x_grid) < 2 && std::abs(current->y - goal_y_grid) < 2) {
+      // Check if close to goal (Stricter check including orientation)
+      double dist_to_goal = std::sqrt(std::pow(current->cx - goal_grid_xy.first, 2) + std::pow(current->cy - goal_grid_xy.second, 2));
+      double angle_to_goal = get_angle_diff(current->theta, goal_theta);
+      
+      // Termination thresholds: 0.5m distance, ~15 degrees orientation
+      if (dist_to_goal < 0.5 && angle_to_goal < 0.26) {
         goal_state = current;
         break;
       }
+      
+      // analytic_expansion (Dubins Shot) with probability or closeness
+      // If we are somewhat close (within 10m?) and heading is aligned, try to shoot
+      if (dist_to_goal < 10.0 && (iterations % 5 == 0)) {
+         // --- Forward Shot ---
+         if (current->direction == 1 || current->direction == 0) {
+             DubinsPath dpath = get_dubins_path(current->cx, current->cy, current->theta, 
+                                                goal_grid_xy.first, goal_grid_xy.second, goal_theta, 
+                                                min_turning_radius_);
+             if (dpath.length < 20.0) { // Feasible length
+                 std::vector<HybridAStarState*> shot_states = sample_dubins(dpath, current, res, 1, 1.0);
+                 if (!shot_states.empty()) {
+                    if (is_collision_free(shot_states, width, height)) {
+                       goal_state = shot_states.back(); 
+                       for(auto s : shot_states) all_states.push_back(s);
+                       break;
+                    } else {
+                       for(auto s : shot_states) delete s;
+                    }
+                 }
+             }
+         }
+         
+         // --- Reverse Shot ---
+         // Try reverse analytic expansion if direction is reverse or neutral
+         if (current->direction == -1 || current->direction == 0) {
+             // Flip start and goal by PI to solve as forward Dubins
+             double start_theta_flip = current->theta + M_PI;
+             double goal_theta_flip = goal_theta + M_PI;
+             
+             DubinsPath dpath = get_dubins_path(current->cx, current->cy, start_theta_flip, 
+                                                goal_grid_xy.first, goal_grid_xy.second, goal_theta_flip, 
+                                                min_turning_radius_);
+                                                
+             if (dpath.length < 20.0) {
+                 // Pass -1 as target_dir, and reverse_penalty_factor (need access to it here, or hardcode 1.05)
+                 std::vector<HybridAStarState*> shot_states = sample_dubins(dpath, current, res, -1, 1.05);
+                  if (!shot_states.empty()) {
+                    if (is_collision_free(shot_states, width, height)) {
+                       goal_state = shot_states.back(); 
+                       for(auto s : shot_states) all_states.push_back(s);
+                       break; // Found Reverse path
+                    } else {
+                       for(auto s : shot_states) delete s;
+                    }
+                 }
+             }
+         }
+      }
 
-      for (auto& action_tuple : actions_weighted) {
-        double dist = std::get<0>(action_tuple);
-        double steer = std::get<1>(action_tuple);
-        double cost_mult = std::get<2>(action_tuple);
+      std::vector<int> directions = {1, -1};
 
-        double new_theta = current->theta + steer * dist;
-        // Normalize theta to [-PI, PI]
-        while (new_theta > M_PI) new_theta -= 2.0 * M_PI;
-        while (new_theta <= -M_PI) new_theta += 2.0 * M_PI;
+      for (int dir : directions) { // Iterate Forward (1) and Reverse (-1)
+          for (double steer : steer_actions) {
+            double dist = step_size * dir;
+            
+            // Calculate costs
+            double base_cost = std::abs(dist); // step_size
+            if (dir == -1) base_cost *= reverse_penalty_factor;
+            
+            // Turn penalty applies to both directions
+            if (std::abs(steer) > 0.01) base_cost *= turn_penalty_factor;
+            
+            // Gear switch penalty (if direction changes)
+            double switch_cost = 0.0;
+            if (current->direction != 0 && dir != current->direction) {
+                switch_cost = gear_switch_penalty;
+            }
+            
+            double steer_diff = std::abs(steer - current->steering);
+            double change_cost = (switch_cost > 0) ? 0.0 : (steer_diff * steer_change_penalty);
+            
+            double new_g = current->g_cost + base_cost + switch_cost + change_cost;
 
-        double new_cx = current->cx + dist * std::cos(new_theta);
-        double new_cy = current->cy + dist * std::sin(new_theta);
-        
-        int grid_new_x = std::round(new_cx / res);
-        int grid_new_y = std::round(new_cy / res);
+            double dtheta = steer * dist;
+            double new_theta = current->theta + dtheta;
+            // Normalize theta to [-PI, PI]
+            while (new_theta > M_PI) new_theta -= 2.0 * M_PI;
+            while (new_theta <= -M_PI) new_theta += 2.0 * M_PI;
+            
+            // Position update - Simple integration
+            // c_x += dist * cos
+            double new_cx = current->cx + dist * std::cos(current->theta + dtheta/2.0);
+            double new_cy = current->cy + dist * std::sin(current->theta + dtheta/2.0);
+            
+            int grid_new_x = std::round(new_cx / res);
+            int grid_new_y = std::round(new_cy / res);
 
-        if (grid_new_x < 0 || grid_new_x >= width || grid_new_y < 0 || grid_new_y >= height) continue;
-        int idx = grid_new_y * width + grid_new_x;
-        if (last_map_->data[idx] > 50) continue; // occupied
+            if (grid_new_x < 0 || grid_new_x >= width || grid_new_y < 0 || grid_new_y >= height) continue;
+            int idx = grid_new_y * width + grid_new_x;
+            if (last_map_->data[idx] > 50) continue; // occupied
 
-        std::string nk = key(grid_new_x, grid_new_y, new_theta);
-        if (closed_list.find(nk) != closed_list.end()) continue;
+            std::string nk = key(grid_new_x, grid_new_y, new_theta);
+            if (closed_list.find(nk) != closed_list.end()) continue;
 
-        double new_g = current->g_cost + dist * cost_mult;
-        // Apply scaling to H cost to match G cost units
-        double new_h = heuristic(grid_new_x, grid_new_y, goal_x_grid, goal_y_grid) * res;
-        
-        HybridAStarState* neighbor = new HybridAStarState(new_cx, new_cy, new_theta, new_g, new_h, current, res);
-        all_states.push_back(neighbor);
-        open_list.push(neighbor);
+            // Apply scaling to H cost to match G cost units
+            double new_h = heuristic(new_cx, new_cy, new_theta, goal_grid_xy.first, goal_grid_xy.second, goal_theta);
+            
+            HybridAStarState* neighbor = new HybridAStarState(new_cx, new_cy, new_theta, steer, dir, new_g, new_h, current, res);
+            all_states.push_back(neighbor);
+            open_list.push(neighbor);
+          }
       }
     }
 
@@ -341,8 +618,19 @@ private:
     return path;
   }
 
-  double heuristic(int x, int y, int gx, int gy) {
-    return std::sqrt((x - gx)*(x - gx) + (y - gy)*(y - gy));
+  double get_angle_diff(double a, double b) {
+    double d = a - b;
+    while (d > M_PI) d -= 2.0 * M_PI;
+    while (d <= -M_PI) d += 2.0 * M_PI;
+    return std::abs(d);
+  }
+
+  double heuristic(double cx, double cy, double ct, double gx, double gy, double gt) {
+    double dist = std::sqrt((cx - gx)*(cx - gx) + (cy - gy)*(cy - gy));
+    double ang_diff = get_angle_diff(ct, gt);
+    // Combined heuristic: Distance + Orientation penalty
+    // Weighting: 1 radian error is roughly equivalent to 2.0 meters of travel cost
+    return dist + 2.0 * ang_diff;
   }
 
   rclcpp::Subscription<TaskGoalData>::SharedPtr sub_task_;
