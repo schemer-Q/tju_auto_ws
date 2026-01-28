@@ -355,7 +355,7 @@ private:
         smoothed_path.poses.front().pose.position.y = start_pose_->pose.position.y;
         smoothed_path.poses.front().pose.orientation = start_pose_->pose.orientation;
         
-        // Enforce exact Goal Pose
+      // Enforce exact Goal Pose
         smoothed_path.poses.back().pose.position.x = msg->end_point.x;
         smoothed_path.poses.back().pose.position.y = msg->end_point.y;
         
@@ -364,6 +364,9 @@ private:
         double half_yaw = msg->end_point.yaw / 2.0;
         smoothed_path.poses.back().pose.orientation.z = std::sin(half_yaw);
         smoothed_path.poses.back().pose.orientation.w = std::cos(half_yaw);
+        
+        // Ensure path continuity at connection point (if two-stage)
+        // If we have a sharp jump in index 1..N due to append, we trust append's linear interpolation.
         
         // Hybrid A* provides valid orientations (kinematic). 
         // Do NOT overwrite them with geometric tangents, as that destroys the smoothness property.
@@ -440,7 +443,116 @@ private:
     RCLCPP_INFO(this->get_logger(), "Published smoothed path for task %u", msg->order_id);
   }
 
+  bool check_segment_collision(double x1, double y1, double x2, double y2, double theta) {
+       double dist = std::hypot(x2-x1, y2-y1);
+       if (dist < 1e-3) return check_collision(x1, y1, theta);
+       
+       int steps = std::ceil(dist / 0.1); 
+       for(int i=0; i<=steps; ++i) {
+           double t = (double)i / steps;
+           double x = x1 + t*(x2-x1);
+           double y = y1 + t*(y2-y1);
+           if (check_collision(x, y, theta)) return true;
+       }
+       return false;
+  }
+
   nav_msgs::msg::Path plan_hybrid_astar(double start_x, double start_y, double start_theta,
+                                         double goal_x, double goal_y, double goal_theta)
+  {
+      double dist_sg = std::hypot(goal_x - start_x, goal_y - start_y);
+      double pre_dist = 1.0;
+      
+      // Calculate Candidates
+      struct Candidate {
+          double x, y;
+          bool is_reverse;
+      };
+      std::vector<Candidate> candidates;
+      
+      // 1. Forward Pre-Goal (Behind the goal)
+      {
+          double px = goal_x - pre_dist * std::cos(goal_theta);
+          double py = goal_y - pre_dist * std::sin(goal_theta);
+          // Only if far enough and segment safe
+          if (dist_sg > pre_dist + 0.5 && !check_segment_collision(px, py, goal_x, goal_y, goal_theta)) {
+              candidates.push_back({px, py, false});
+          }
+      }
+      
+      // 2. Reverse Pre-Goal (In front of the goal)
+      {
+          double px = goal_x + pre_dist * std::cos(goal_theta);
+          double py = goal_y + pre_dist * std::sin(goal_theta);
+          // Only if segment safe. Distance check is less critical for reverse approach, but let's keep it sane.
+          double dist_rev = std::hypot(px - start_x, py - start_y);
+           if (dist_rev > 0.5 && !check_segment_collision(px, py, goal_x, goal_y, goal_theta)) {
+              candidates.push_back({px, py, true});
+          }
+      }
+      
+      // If we have candidates, try them
+      nav_msgs::msg::Path best_path;
+      double min_len = 1e9;
+      bool found_pre = false;
+      
+      for (const auto& cand : candidates) {
+          std::string type = cand.is_reverse ? "Reverse" : "Forward";
+          RCLCPP_INFO(this->get_logger(), "Attempting Pre-Goal (%s) Approach...", type.c_str());
+          
+          nav_msgs::msg::Path p = compute_hybrid_path(start_x, start_y, start_theta, cand.x, cand.y, goal_theta);
+          
+          if (!p.poses.empty()) {
+              // Calculate length
+              double len = 0.0;
+              for(size_t i=1; i<p.poses.size(); ++i) {
+                  double dx = p.poses[i].pose.position.x - p.poses[i-1].pose.position.x;
+                  double dy = p.poses[i].pose.position.y - p.poses[i-1].pose.position.y;
+                  len += std::hypot(dx, dy);
+              }
+              
+              if (len < min_len) {
+                  min_len = len;
+                  best_path = append_straight_line(p, cand.x, cand.y, goal_x, goal_y, goal_theta);
+                  found_pre = true;
+              }
+          }
+      }
+      
+      if (found_pre) {
+          RCLCPP_INFO(this->get_logger(), "Selected optimal Pre-Goal approach.");
+          return best_path;
+      }
+      
+      RCLCPP_WARN(this->get_logger(), "All Pre-Goal approaches failed or invalid. Falling back to Direct Goal.");
+      
+      // Fallback or Direct
+      return compute_hybrid_path(start_x, start_y, start_theta, goal_x, goal_y, goal_theta);
+  }
+  
+  nav_msgs::msg::Path append_straight_line(nav_msgs::msg::Path path, double px, double py, double gx, double gy, double theta) {
+      double dist = std::hypot(gx - px, gy - py);
+      int steps = std::ceil(dist / 0.1); // 1m -> 10 steps
+      
+      geometry_msgs::msg::Quaternion q;
+      q.z = std::sin(theta/2.0);
+      q.w = std::cos(theta/2.0);
+      
+      // Start from 1 because 0 is pre_goal which is already in path
+      for(int i=1; i<=steps; ++i) {
+          double t = (double)i / steps;
+          geometry_msgs::msg::PoseStamped ps;
+          ps.header = path.header;
+          ps.pose.position.x = px + t*(gx-px);
+          ps.pose.position.y = py + t*(gy-py);
+          ps.pose.position.z = 0.0;
+          ps.pose.orientation = q;
+          path.poses.push_back(ps);
+      }
+      return path;
+  }
+
+  nav_msgs::msg::Path compute_hybrid_path(double start_x, double start_y, double start_theta,
                                          double goal_x, double goal_y, double goal_theta)
   {
     nav_msgs::msg::Path path;
