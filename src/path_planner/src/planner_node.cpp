@@ -4,6 +4,8 @@
 #include <geometry_msgs/msg/pose_stamped.hpp>
 #include <visualization_msgs/msg/marker_array.hpp>
 #include <control_task_msgs/msg/task_goal_data.hpp>
+#include <planning_msgs/msg/local_trajectory_points.hpp>
+#include <common_msgs/msg/pose_point.hpp>
 #include <vector>
 #include <queue>
 #include <unordered_map>
@@ -22,6 +24,11 @@ struct DubinsPath {
     DubinsPath() : length(std::numeric_limits<double>::max()), turning_radius(1.0) {}
 };
 // --------------------------
+
+struct PlanningResult {
+    nav_msgs::msg::Path path;
+    std::vector<int8_t> gears; // 1: Reverse, 3: Forward, 2: Neutral
+};
 
 struct HybridAStarState {
     int x, y; // Grid indices for lookup
@@ -289,6 +296,7 @@ public:
     sub_start_ = this->create_subscription<geometry_msgs::msg::PoseStamped>("/start_pose", 10, std::bind(&PlannerNode::on_start, this, std::placeholders::_1));
     pub_path_ = this->create_publisher<nav_msgs::msg::Path>("/planner/global_path", 10);
     pub_markers_ = this->create_publisher<visualization_msgs::msg::MarkerArray>("/planner/footprints", 10);
+    pub_traj_ = this->create_publisher<planning_msgs::msg::LocalTrajectoryPoints>("/planner/local_trajectory", 10);
     // parameters
     this->declare_parameter<double>("min_turning_radius", 1.0);
     min_turning_radius_ = this->get_parameter("min_turning_radius").as_double();
@@ -342,11 +350,11 @@ private:
                 origin_yaw);
 
     double start_yaw = yaw_from_quat(start_pose_->pose.orientation);
-    nav_msgs::msg::Path raw_path = plan_hybrid_astar(start_pose_->pose.position.x, start_pose_->pose.position.y, start_yaw,
+    PlanningResult result = plan_hybrid_astar(start_pose_->pose.position.x, start_pose_->pose.position.y, start_yaw,
                                                        msg->end_point.x, msg->end_point.y, msg->end_point.yaw);
-    // nav_msgs::msg::Path smoothed_path = smooth_path(raw_path);
+    // nav_msgs::msg::Path smoothed_path = smooth_path(result);
     // Skip smoothing to preserve kinematic constraints (curvature limits) enforced by Hybrid A*
-    nav_msgs::msg::Path smoothed_path = raw_path; 
+    nav_msgs::msg::Path smoothed_path = result.path; 
 
     // Post-process: Recalculate Orientations and enforce exact start/goal
     if (!smoothed_path.poses.empty()) {
@@ -425,6 +433,56 @@ private:
     // Visualize Vehicle Footprints periodically
     publish_vehicle_footprints(smoothed_path);
 
+    // Publish Custom Trajectory Message
+    planning_msgs::msg::LocalTrajectoryPoints traj_msg;
+    traj_msg.header = smoothed_path.header;
+    traj_msg.task_type = 0; // Normal tracking
+    traj_msg.points_cnt = smoothed_path.poses.size();
+    traj_msg.replan_counter = msg->order_id; 
+    
+    double total_dist = 0.0;
+    
+    for (size_t i = 0; i < smoothed_path.poses.size(); ++i) {
+        common_msgs::msg::PosePoint pp;
+        pp.x = smoothed_path.poses[i].pose.position.x;
+        pp.y = smoothed_path.poses[i].pose.position.y;
+        pp.z = 0.0;
+        pp.yaw = yaw_from_quat(smoothed_path.poses[i].pose.orientation);
+        pp.pitch = 0.0;
+        pp.roll = 0.0;
+        pp.speed = 0.0; 
+        pp.acc = 0.0;
+        pp.curve = 0.0; 
+        
+        // Use internal gear state from A* (Ensures consistency with planner direction)
+        if (i < result.gears.size()) {
+            pp.gear = result.gears[i];
+            // Fix: Start point usually has direction=0 (Neutral), overwrite with 2nd point's gear 
+            // so controller knows initial direction immediately.
+            if (i == 0 && result.gears.size() > 1) {
+                pp.gear = result.gears[1];
+            }
+        } else {
+            pp.gear = 2; // Neutral fallback
+        }
+        
+        traj_msg.trajectory.push_back(pp);
+        
+        if (i > 0) {
+            double dx = pp.x - traj_msg.trajectory[i-1].x;
+            double dy = pp.y - traj_msg.trajectory[i-1].y;
+            total_dist += std::hypot(dx, dy);
+        }
+    }
+    
+    if (traj_msg.points_cnt > 1) {
+        traj_msg.step_length = total_dist / (traj_msg.points_cnt - 1);
+    } else {
+        traj_msg.step_length = 0.0;
+    }
+    
+    pub_traj_->publish(traj_msg);
+
     // Print path coordinates for comparison
     size_t n = smoothed_path.poses.size();
     RCLCPP_INFO(this->get_logger(), "Smoothed path size: %zu", n);
@@ -457,7 +515,7 @@ private:
        return false;
   }
 
-  nav_msgs::msg::Path plan_hybrid_astar(double start_x, double start_y, double start_theta,
+  PlanningResult plan_hybrid_astar(double start_x, double start_y, double start_theta,
                                          double goal_x, double goal_y, double goal_theta)
   {
       double dist_sg = std::hypot(goal_x - start_x, goal_y - start_y);
@@ -492,7 +550,7 @@ private:
       }
       
       // If we have candidates, try them
-      nav_msgs::msg::Path best_path;
+      PlanningResult best_result;
       double min_len = 1e9;
       bool found_pre = false;
       
@@ -500,20 +558,21 @@ private:
           std::string type = cand.is_reverse ? "Reverse" : "Forward";
           RCLCPP_INFO(this->get_logger(), "Attempting Pre-Goal (%s) Approach...", type.c_str());
           
-          nav_msgs::msg::Path p = compute_hybrid_path(start_x, start_y, start_theta, cand.x, cand.y, goal_theta);
+          PlanningResult p = compute_hybrid_path(start_x, start_y, start_theta, cand.x, cand.y, goal_theta);
           
-          if (!p.poses.empty()) {
+          if (!p.path.poses.empty()) {
               // Calculate length
               double len = 0.0;
-              for(size_t i=1; i<p.poses.size(); ++i) {
-                  double dx = p.poses[i].pose.position.x - p.poses[i-1].pose.position.x;
-                  double dy = p.poses[i].pose.position.y - p.poses[i-1].pose.position.y;
+              for(size_t i=1; i<p.path.poses.size(); ++i) {
+                  double dx = p.path.poses[i].pose.position.x - p.path.poses[i-1].pose.position.x;
+                  double dy = p.path.poses[i].pose.position.y - p.path.poses[i-1].pose.position.y;
                   len += std::hypot(dx, dy);
               }
               
               if (len < min_len) {
                   min_len = len;
-                  best_path = append_straight_line(p, cand.x, cand.y, goal_x, goal_y, goal_theta);
+                  append_straight_line(p, cand.x, cand.y, goal_x, goal_y, goal_theta);
+                  best_result = p;
                   found_pre = true;
               }
           }
@@ -521,7 +580,7 @@ private:
       
       if (found_pre) {
           RCLCPP_INFO(this->get_logger(), "Selected optimal Pre-Goal approach.");
-          return best_path;
+          return best_result;
       }
       
       RCLCPP_WARN(this->get_logger(), "All Pre-Goal approaches failed or invalid. Falling back to Direct Goal.");
@@ -530,13 +589,20 @@ private:
       return compute_hybrid_path(start_x, start_y, start_theta, goal_x, goal_y, goal_theta);
   }
   
-  nav_msgs::msg::Path append_straight_line(nav_msgs::msg::Path path, double px, double py, double gx, double gy, double theta) {
+  void append_straight_line(PlanningResult& res, double px, double py, double gx, double gy, double theta) {
+      nav_msgs::msg::Path& path = res.path;
       double dist = std::hypot(gx - px, gy - py);
       int steps = std::ceil(dist / 0.1); // 1m -> 10 steps
       
       geometry_msgs::msg::Quaternion q;
       q.z = std::sin(theta/2.0);
       q.w = std::cos(theta/2.0);
+      
+      // Determine gear for straight segment
+      double dx = gx - px;
+      double dy = gy - py;
+      int8_t seg_gear = 3; // Forward
+      if ((dx * std::cos(theta) + dy * std::sin(theta)) < 0) seg_gear = 1; // Reverse
       
       // Start from 1 because 0 is pre_goal which is already in path
       for(int i=1; i<=steps; ++i) {
@@ -548,14 +614,15 @@ private:
           ps.pose.position.z = 0.0;
           ps.pose.orientation = q;
           path.poses.push_back(ps);
+          res.gears.push_back(seg_gear);
       }
-      return path;
   }
 
-  nav_msgs::msg::Path compute_hybrid_path(double start_x, double start_y, double start_theta,
+  PlanningResult compute_hybrid_path(double start_x, double start_y, double start_theta,
                                          double goal_x, double goal_y, double goal_theta)
   {
-    nav_msgs::msg::Path path;
+    PlanningResult result;
+    nav_msgs::msg::Path& path = result.path;
     // Discretize map
     double res = last_map_->info.resolution;
     int width = last_map_->info.width;
@@ -805,6 +872,11 @@ private:
         ps.pose.orientation.z = std::sin(world_theta / 2.0);
         ps.pose.orientation.w = std::cos(world_theta / 2.0);
         path.poses.push_back(ps);
+        
+        int8_t g = 2;
+        if (state->direction == 1) g = 3;
+        else if (state->direction == -1) g = 1;
+        result.gears.push_back(g);
       }
     } else {
       RCLCPP_WARN(this->get_logger(), "Hybrid A* failed to find path");
@@ -813,7 +885,7 @@ private:
     // Clean up memory
     for (auto& s : all_states) delete s;
 
-    return path;
+    return result;
   }
 
   double get_angle_diff(double a, double b) {
@@ -836,6 +908,7 @@ private:
   rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr sub_start_;
   rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr pub_path_;
   rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr pub_markers_;
+  rclcpp::Publisher<planning_msgs::msg::LocalTrajectoryPoints>::SharedPtr pub_traj_;
   nav_msgs::msg::OccupancyGrid::SharedPtr last_map_;
   geometry_msgs::msg::PoseStamped::SharedPtr start_pose_;
   double min_turning_radius_;
@@ -846,7 +919,10 @@ private:
   double back_to_axle_;
   double front_to_axle_;
 
-  nav_msgs::msg::Path smooth_path(const nav_msgs::msg::Path& raw_path) {
+  nav_msgs::msg::Path smooth_path(const PlanningResult& result) {
+    const nav_msgs::msg::Path& raw_path = result.path;
+    const std::vector<int8_t>& gears = result.gears;
+    
     nav_msgs::msg::Path smoothed_path = raw_path;
 
     if (raw_path.poses.size() < 3) {
@@ -862,6 +938,13 @@ private:
     while (change) {
       change = false;
       for (size_t i = 1; i < raw_path.poses.size() - 1; ++i) {
+        
+        // Cusp protection: If direction changes at this point, do not smooth it.
+        // gears[i] is direction arriving at i. gears[i+1] is direction leaving i.
+        if (i + 1 < gears.size()) {
+            if (gears[i] != gears[i+1]) continue; 
+        }
+
         auto& prev = smoothed_path.poses[i - 1].pose.position;
         auto& curr = smoothed_path.poses[i].pose.position;
         auto& next = smoothed_path.poses[i + 1].pose.position;
