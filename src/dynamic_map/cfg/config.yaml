@@ -1,0 +1,17 @@
+dynamic_map_node:
+  ros__parameters:
+    # Map Properties
+    map_size_x: 100
+    map_size_y: 100
+    map_resolution: 0.1
+    inflation_radius: 0.3
+    
+    # Sensor Topics
+    lidar_topic: "/rslidar_points"
+    odom_topic: "/sensor/odometry"
+    
+    # Map Publisher Topics
+    map_static_topic: "/map/static"
+    map_dynamic_topic: "/map/dynamic"
+    map_inflated_topic: "/map/inflated"
+    map_combined_topic: "/map/combined"

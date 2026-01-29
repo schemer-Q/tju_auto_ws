@@ -1,6 +1,11 @@
 #include <rclcpp/rclcpp.hpp>
 #include <nav_msgs/msg/occupancy_grid.hpp>
+#include <nav_msgs/msg/odometry.hpp>
+#include <sensor_msgs/msg/point_cloud2.hpp>
+#include <sensor_msgs/point_cloud2_iterator.hpp>
+#include <geometry_msgs/msg/pose.hpp>
 #include <vector>
+#include <cmath>
 
 using std::placeholders::_1;
 
@@ -14,20 +19,53 @@ public:
     this->declare_parameter<int>("map_size_y", 100);
     this->declare_parameter<double>("map_resolution", 0.1);
     this->declare_parameter<double>("inflation_radius", 0.3); // meters
+    this->declare_parameter<std::string>("lidar_topic", "/rslidar_points");
+    this->declare_parameter<std::string>("odom_topic", "/sensor/odometry");
+    this->declare_parameter<std::string>("map_static_topic", "/map/static");
+    this->declare_parameter<std::string>("map_dynamic_topic", "/map/dynamic");
+    this->declare_parameter<std::string>("map_inflated_topic", "/map/inflated");
+    this->declare_parameter<std::string>("map_combined_topic", "/map/combined");
 
     size_x_ = this->get_parameter("map_size_x").as_int();
     size_y_ = this->get_parameter("map_size_y").as_int();
     resolution_ = this->get_parameter("map_resolution").as_double();
     inflation_radius_ = this->get_parameter("inflation_radius").as_double();
+    
+    std::string lidar_topic = this->get_parameter("lidar_topic").as_string();
+    std::string odom_topic = this->get_parameter("odom_topic").as_string();
+    std::string map_static_topic = this->get_parameter("map_static_topic").as_string();
+    std::string map_dynamic_topic = this->get_parameter("map_dynamic_topic").as_string();
+    std::string map_inflated_topic = this->get_parameter("map_inflated_topic").as_string();
+    std::string map_combined_topic = this->get_parameter("map_combined_topic").as_string();
 
-    pub_static_ = this->create_publisher<nav_msgs::msg::OccupancyGrid>("/map/static", 10);
-    pub_dynamic_ = this->create_publisher<nav_msgs::msg::OccupancyGrid>("/map/dynamic", 10);
-    pub_inflated_ = this->create_publisher<nav_msgs::msg::OccupancyGrid>("/map/inflated", 10);
-    pub_combined_ = this->create_publisher<nav_msgs::msg::OccupancyGrid>("/map/combined", 10);
-    timer_ = this->create_wall_timer(std::chrono::milliseconds(1000), std::bind(&DynamicMapNode::on_timer, this));
+    pub_static_ = this->create_publisher<nav_msgs::msg::OccupancyGrid>(map_static_topic, 10);
+    pub_dynamic_ = this->create_publisher<nav_msgs::msg::OccupancyGrid>(map_dynamic_topic, 10);
+    pub_inflated_ = this->create_publisher<nav_msgs::msg::OccupancyGrid>(map_inflated_topic, 10);
+    pub_combined_ = this->create_publisher<nav_msgs::msg::OccupancyGrid>(map_combined_topic, 10);
+    
+    sub_odom_ = this->create_subscription<nav_msgs::msg::Odometry>(
+      odom_topic, 10, std::bind(&DynamicMapNode::on_odom, this, _1));
+    sub_lidar_ = this->create_subscription<sensor_msgs::msg::PointCloud2>(
+      lidar_topic, 10, std::bind(&DynamicMapNode::on_lidar, this, _1));
+
+    timer_ = this->create_wall_timer(std::chrono::milliseconds(100), std::bind(&DynamicMapNode::on_timer, this));
   }
 
 private:
+  void on_odom(const nav_msgs::msg::Odometry::SharedPtr msg) {
+    current_odom_ = msg;
+  }
+
+  void on_lidar(const sensor_msgs::msg::PointCloud2::SharedPtr msg) {
+    latest_cloud_ = msg;
+  }
+
+  double quaternion_to_yaw(const geometry_msgs::msg::Quaternion& q) {
+      double siny_cosp = 2.0 * (q.w * q.z + q.x * q.y);
+      double cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z);
+      return std::atan2(siny_cosp, cosy_cosp);
+  }
+
   void on_timer()
   {
     auto now = this->now();
@@ -35,12 +73,43 @@ private:
     auto dynamic_grid = make_grid(0);
     auto inflated_grid = make_grid(0);
 
-    // simulate one dynamic obstacle at center
-    int cx = size_x_/2;
-    int cy = size_y_/2;
-    int idx = cy * size_x_ + cx;
-    if (idx >= 0 && idx < (int)dynamic_grid.data.size())
-      dynamic_grid.data[idx] = 100;
+    if (current_odom_ && latest_cloud_) {
+        double yaw = quaternion_to_yaw(current_odom_->pose.pose.orientation);
+        double rx = current_odom_->pose.pose.position.x;
+        double ry = current_odom_->pose.pose.position.y;
+        double cos_yaw = std::cos(yaw);
+        double sin_yaw = std::sin(yaw);
+
+        // Process PointCloud2
+        sensor_msgs::PointCloud2Iterator<float> iter_x(*latest_cloud_, "x");
+        sensor_msgs::PointCloud2Iterator<float> iter_y(*latest_cloud_, "y");
+        sensor_msgs::PointCloud2Iterator<float> iter_z(*latest_cloud_, "z");
+
+        for (; iter_x != iter_x.end(); ++iter_x, ++iter_y, ++iter_z) {
+            float px = *iter_x;
+            float py = *iter_y;
+            float pz = *iter_z;
+
+            if (std::isnan(px) || std::isnan(py) || std::isnan(pz)) continue;
+            
+            // Simple filter for ground or too high
+            if (pz < -0.5 || pz > 3.0) continue; 
+
+            // Transform to map frame (Assuming point cloud is in base_link or similar relative frame)
+            // P_map = R * P_sensor + T_robot
+            double ox = rx + (px * cos_yaw - py * sin_yaw);
+            double oy = ry + (px * sin_yaw + py * cos_yaw);
+            
+            // Convert to grid coords
+            int gx = (int)(ox / resolution_);
+            int gy = (int)(oy / resolution_);
+            
+            if (gx >= 0 && gx < size_x_ && gy >= 0 && gy < size_y_) {
+                int idx = gy * size_x_ + gx;
+                dynamic_grid.data[idx] = 100;
+            }
+        }
+    }
 
     // inflation using BFS (radius in cells)
     int radius_cells = std::max(0, (int)std::ceil(inflation_radius_ / resolution_));
@@ -125,6 +194,11 @@ private:
   int size_y_;
   double resolution_;
   double inflation_radius_;
+
+  rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr sub_odom_;
+  rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr sub_lidar_;
+  nav_msgs::msg::Odometry::SharedPtr current_odom_;
+  sensor_msgs::msg::PointCloud2::SharedPtr latest_cloud_;
 };
 
 int main(int argc, char ** argv)
