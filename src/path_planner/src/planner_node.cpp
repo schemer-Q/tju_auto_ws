@@ -301,6 +301,21 @@ public:
     this->declare_parameter<double>("min_turning_radius", 1.0);
     min_turning_radius_ = this->get_parameter("min_turning_radius").as_double();
     
+    this->declare_parameter<double>("max_speed", 2.0); // m/s
+    this->declare_parameter<double>("max_accel", 1.0); // m/s^2
+    this->declare_parameter<double>("max_lat_accel", 1.5); // m/s^2 (limit cornering speed)
+    
+    max_speed_ = this->get_parameter("max_speed").as_double();
+    max_accel_ = this->get_parameter("max_accel").as_double();
+    max_lat_accel_ = this->get_parameter("max_lat_accel").as_double();
+
+    RCLCPP_INFO(this->get_logger(), "Planner Parameters: Radius=%.2f, MaxSpeed=%.2f, MaxAccel=%.2f, MaxLatAccel=%.2f", 
+        min_turning_radius_, max_speed_, max_accel_, max_lat_accel_);
+    
+            // Create a parameter callback to handle updates
+        param_callback_handle_ = this->add_on_set_parameters_callback(
+            std::bind(&PlannerNode::parametersCallback, this, std::placeholders::_1));
+
     // Default vehicle dimensions (Standard Sedan)
     vehicle_length_ = 4.7; 
     vehicle_width_ = 2.0; 
@@ -474,6 +489,9 @@ private:
             total_dist += std::hypot(dx, dy);
         }
     }
+    
+    // Generate Speed Profile before publishing
+    generate_speed_profile(traj_msg);
     
     if (traj_msg.points_cnt > 1) {
         traj_msg.step_length = total_dist / (traj_msg.points_cnt - 1);
@@ -912,12 +930,41 @@ private:
   nav_msgs::msg::OccupancyGrid::SharedPtr last_map_;
   geometry_msgs::msg::PoseStamped::SharedPtr start_pose_;
   double min_turning_radius_;
+  double max_speed_;
+  double max_accel_;
+  double max_lat_accel_;
 
   // Vehicle Dimensions for Collision Checking
   double vehicle_length_;
   double vehicle_width_;
   double back_to_axle_;
   double front_to_axle_;
+
+  rclcpp::Node::OnSetParametersCallbackHandle::SharedPtr param_callback_handle_;
+
+  rcl_interfaces::msg::SetParametersResult parametersCallback(
+    const std::vector<rclcpp::Parameter> &parameters)
+  {
+    rcl_interfaces::msg::SetParametersResult result;
+    result.successful = true;
+    result.reason = "success";
+
+    for (const auto &param : parameters)
+    {
+      if (param.get_name() == "max_speed")
+      {
+        max_speed_ = param.as_double();
+        RCLCPP_INFO(this->get_logger(), "Parameter updated: max_speed = %.2f", max_speed_);
+      }
+      else if (param.get_name() == "max_accel")
+      {
+        max_accel_ = param.as_double();
+        RCLCPP_INFO(this->get_logger(), "Parameter updated: max_accel = %.2f", max_accel_);
+      }
+      // Add others if needed
+    }
+    return result;
+  }
 
   nav_msgs::msg::Path smooth_path(const PlanningResult& result) {
     const nav_msgs::msg::Path& raw_path = result.path;
@@ -1040,6 +1087,104 @@ private:
       }
       
       pub_markers_->publish(mk_array);
+  }
+
+  void generate_speed_profile(planning_msgs::msg::LocalTrajectoryPoints& traj) {
+      if (traj.trajectory.empty()) return;
+
+      size_t N = traj.trajectory.size();
+      std::vector<double> dists(N, 0.0);
+      std::vector<double> curvatures(N, 0.0);
+      std::vector<double> v_limit(N, max_speed_);
+      
+      // 1. Calculate Distances and Curvatures
+      for (size_t i = 0; i < N - 1; ++i) {
+          double dx = traj.trajectory[i+1].x - traj.trajectory[i].x;
+          double dy = traj.trajectory[i+1].y - traj.trajectory[i].y;
+          dists[i] = std::hypot(dx, dy);
+          
+          if (dists[i] < 1e-4) {
+              dists[i] = 1e-4; // Avoid division by zero
+          }
+          
+          double dyaw = traj.trajectory[i+1].yaw - traj.trajectory[i].yaw;
+          while(dyaw > M_PI) dyaw -= 2.0 * M_PI;
+          while(dyaw <= -M_PI) dyaw += 2.0 * M_PI;
+          
+          double k = std::abs(dyaw) / dists[i];
+          curvatures[i] = k;
+          if (i > 0) traj.trajectory[i].curve = k;
+          
+          // Apply Curvature Speed Limit (v^2 = a_lat / k)
+          if (k > 1e-3) {
+              double v_k = std::sqrt(max_lat_accel_ / k);
+              if (v_k < v_limit[i]) v_limit[i] = v_k;
+          }
+      }
+      dists[N-1] = 0.0;
+      v_limit[N-1] = 0.0; // End stop
+
+      // 2. Identify Stop Points (Gear Changes)
+      // v_limit[i] should be 0 if switching gear
+      for (size_t i = 0; i < N - 1; ++i) {
+          if (traj.trajectory[i].gear != traj.trajectory[i+1].gear) {
+              v_limit[i] = 0.0;
+              v_limit[i+1] = 0.0; // Ensure full stop at switch
+          }
+      }
+      
+      // Start is usually 0 unless we implement replanning with initial speed
+      v_limit[0] = 0.0; 
+
+      // 3. Forward Pass (Acceleration Limit)
+      // v_i+1 <= sqrt( v_i^2 + 2*a*d )
+      std::vector<double> v_fwd(N, 0.0);
+      v_fwd[0] = v_limit[0];
+      
+      for (size_t i = 0; i < N - 1; ++i) {
+          double max_next_v_sq = v_fwd[i]*v_fwd[i] + 2.0 * max_accel_ * dists[i];
+          double max_next = std::sqrt(max_next_v_sq);
+          
+          v_fwd[i+1] = std::min(max_next, v_limit[i+1]);
+      }
+      
+      // 4. Backward Pass (Deceleration Limit)
+      // v_i <= sqrt( v_i+1^2 + 2*a*d )
+      std::vector<double> v_final(N, 0.0);
+      v_final[N-1] = v_limit[N-1]; // should be 0
+      
+      for (int i = N - 2; i >= 0; --i) {
+          double max_curr_v_sq = v_final[i+1]*v_final[i+1] + 2.0 * max_accel_ * dists[i];
+          double max_curr = std::sqrt(max_curr_v_sq);
+          
+          double v_bwd = std::min(max_curr, v_limit[i]);
+          v_final[i] = std::min(v_fwd[i], v_bwd);
+      }
+      
+      // 5. Compute Acceleration and assign to trajectory
+      for (size_t i = 0; i < N; ++i) {
+          traj.trajectory[i].speed = v_final[i];
+          
+          if (i < N - 1) {
+              // a = (v_f^2 - v_i^2) / 2d
+              // Careful with small d
+              if (dists[i] > 1e-3) {
+                  double vi = v_final[i];
+                  double vf = v_final[i+1];
+                  double a = (vf*vf - vi*vi) / (2.0 * dists[i]);
+                  
+                  // Clamp for numerical noise
+                  if (a > max_accel_) a = max_accel_;
+                  if (a < -max_accel_) a = -max_accel_;
+                  
+                  traj.trajectory[i].acc = a;
+              } else {
+                  traj.trajectory[i].acc = 0.0;
+              }
+          } else {
+             traj.trajectory[i].acc = 0.0; 
+          }
+      }
   }
 };
 

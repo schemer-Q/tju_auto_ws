@@ -1,0 +1,6 @@
+planner_node:
+  ros__parameters:
+    min_turning_radius: 4.0
+    max_speed: 1.0         # m/s, 全局最大速度限制
+    max_accel: 1.0         # m/s^2, 纵向加减速度限制
+    max_lat_accel: 1.5     # m/s^2, 横向加速度（过弯）限制

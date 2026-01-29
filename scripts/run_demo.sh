@@ -24,6 +24,7 @@ fi
 
 MAP_PUB="$WS_DIR/install/dynamic_map/lib/dynamic_map/mock_map_pub.py"
 PLANNER_BIN="$WS_DIR/install/path_planner/lib/path_planner/planner_node"
+PLANNER_CONFIG="$WS_DIR/install/path_planner/share/path_planner/cfg/config.yaml"
 
 if [[ ! -x "$MAP_PUB" ]]; then
   echo "[ERROR] mock_map_pub.py not found or not executable: $MAP_PUB" >&2
@@ -37,7 +38,14 @@ fi
 # Start processes
 "$MAP_PUB" --map_yaml "$MAP_YAML" > /tmp/mock_map.log 2>&1 &
 MAP_PID=$!
-"$PLANNER_BIN" > /tmp/planner.log 2>&1 &
+
+if [[ -f "$PLANNER_CONFIG" ]]; then
+    # Pass config file using --ros-args --params-file
+    "$PLANNER_BIN" --ros-args --params-file "$PLANNER_CONFIG" > /tmp/planner.log 2>&1 &
+else
+    echo "[WARN] Config file not found: $PLANNER_CONFIG. Using defaults."
+    "$PLANNER_BIN" > /tmp/planner.log 2>&1 &
+fi
 PLANNER_PID=$!
 
 echo "[INFO] mock_map_pub PID: $MAP_PID (log: /tmp/mock_map.log)"
