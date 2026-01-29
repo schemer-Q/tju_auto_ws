@@ -10,6 +10,12 @@ def generate_launch_description():
         'config.yaml'
     )
 
+    rviz_config = os.path.join(
+        get_package_share_directory('path_planner'),
+        'rviz',
+        'planner_view.rviz'
+    )
+
     return LaunchDescription([
         Node(
             package='path_planner',
@@ -17,5 +23,12 @@ def generate_launch_description():
             name='planner_node',
             output='screen',
             parameters=[config]
+        ),
+        Node(
+            package='rviz2',
+            executable='rviz2',
+            name='rviz2',
+            output='screen',
+            arguments=['-d', rviz_config]
         )
     ])
