@@ -1,0 +1,31 @@
+{
+	"name": "ROS 2 Foxy Dev Container",
+	"build": {
+		"dockerfile": "Dockerfile",
+		"args": {
+			"USERNAME": "ros"
+		}
+	},
+	"remoteUser": "ros",
+	"runArgs": [
+		"--network=host",
+		"--gpus=all",
+		"--security-opt=seccomp=unconfined",
+        "--security-opt=apparmor=unconfined",
+		"-v", "/tmp/.X11-unix:/tmp/.X11-unix",
+		"-e", "DISPLAY=${localEnv:DISPLAY}",
+		"-e", "QT_X11_NO_MITSHM=1"
+	],
+	"customizations": {
+		"vscode": {
+			"extensions": [
+				"ms-vscode.cpptools",
+				"ms-python.python",
+				"ms-iot.vscode-ros",
+				"twxs.cmake",
+				"yzhang.markdown-all-in-one"
+			]
+		}
+	},
+	"postCreateCommand": "sudo pip3 install rosdepc && sudo rosdepc init && rosdepc update && sudo rosdepc install --from-paths src --ignore-src -y && colcon build --symlink-install"
+}
